@@ -340,7 +340,9 @@ class GroupedBlockGemm:
             )
         else:
             assert self.xch_layout is None or ops.promoted, self.chain
-            xch = xch_smem_bytes(self.xch_layout)
+            # the promoted plan holds the exchange buffer's bytes back for every chain (:meth:`.operands.PromotedOperands.plan`):
+            # one ring depth per record, whichever spelling of the chain runs
+            xch = 0 if ops.promoted else xch_smem_bytes(self.xch_layout)
 
             def plan(extra: int):
                 return ops.plan(

@@ -97,6 +97,7 @@ from .epilogue_fp8bs import (
     swap_bs_mma_loop,
     swap_bs_producer_loop,
     swap_scale_ring_bytes,
+    xch_floats,
 )
 from .scheduler import EPI_WARPGROUPS_DENSE, MAX_E
 
@@ -522,6 +523,12 @@ class PromotedOperands:
     def mainloop(self, body: str) -> MainloopBlock:
         return MainloopBlock(self.in_fmt)
 
+    @property
+    def xch_reserve_bytes(self) -> int:
+        """The fused requantization's half-block amax exchange, held back from the grouped ring for every chain: the quantising
+        and the plain spellings of a record share one plan (one ring depth per record)."""
+        return 4 * xch_floats()
+
     def scale_ring_bytes(self, knobs: Knobs, body: str) -> int:
         """Smem of the fp32 scale ring: per stage the tile's row (token) scales and its weight slot scales, ``spb`` blocks each."""
         if body == "grouped":
@@ -551,7 +558,8 @@ class PromotedOperands:
             extra_smem_bytes=extra_smem_bytes,
             in_fmt=self.in_fmt if body == "grouped" else "bf16",
             acc_stages=acc_stages_for(knobs),
-            reserve_smem_bytes=self.scale_ring_bytes(knobs, body),
+            reserve_smem_bytes=self.scale_ring_bytes(knobs, body)
+            + (self.xch_reserve_bytes if body == "grouped" else 0),
         )
 
     def tmem_alloc_kwargs(self, st) -> dict:
