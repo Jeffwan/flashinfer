@@ -9,7 +9,8 @@ ranked by the dense dispatcher's model at the dense shape whose tiles, M tail an
 (``in_fmt="e4m3_bs"``: the fp8 instruction rate, the promotion hand-off chain, no 2-CTA issue gain for the lockstep pair),
 with the dense dispatcher's decode guard and its few-token N-cluster rule, mapped onto the grouped space and filtered by the
 grouped body's acceptance. The requantization's two spellings (GEMM1's epilogue on the whole-block tiles, or the standalone
-pass on the bf16 intermediate) are placements of one term: ``fused_quant_default`` picks by the rows per active expert.
+pass on the bf16 intermediate) are placements of one term: ``fused_quant_default`` picks the epilogue for the chain whose block
+is formed inside one promotion warpgroup (the ungated chain) from a row count per active expert, the standalone pass otherwise.
 Numerics-neutral: every record of the space computes the class.
 """
 
@@ -109,8 +110,8 @@ def can_implement_fp8bs(
     ) or can_implement_swapped_fp8bs(knobs, N, K, E, chain, interleaved, block)
 
 
-#: The fused requantization (GEMM1's output blocks quantized in its epilogue, the 256-wide gated tile) from this many rows per
-#: active expert; below it the standalone pass and GEMM1's free tile choice (empirical; a placement).
+#: The fused requantization (GEMM1's output blocks quantized in its epilogue, the 256-wide tile) from this many rows per active
+#: expert; below it the standalone pass and GEMM1's free tile choice (empirical; a placement).
 FUSED_QUANT_MIN_ROWS = 128
 
 
@@ -327,11 +328,19 @@ def _rank_grouped_fp8bs(
     return tuple(out[:k])
 
 
-def fused_quant_default(T: int, k: int, E: int, block: int = QBLOCK) -> bool:
+def fused_quant_default(
+    T: int, k: int, E: int, block: int = QBLOCK, gated: bool = True
+) -> bool:
     """Whether the block-scale op requantizes GEMM1's output in the epilogue (the wide-tile records) or by the standalone quantizer
-    pass at this (T, k, E) by default: a placement rule on the rows per active expert, both spellings the same bits. The 32-wide
-    class requantizes by the standalone pass only (the fused epilogue is the 128-wide class's)."""
-    return block == QBLOCK and rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
+    pass at this (T, k, E) by default, both spellings the same bits: the epilogue for the ungated chain, whose 128-output block
+    is formed inside one promotion warpgroup, from a row count per active expert; the standalone pass for the gated chain, whose
+    block spans the two warpgroups' halves and whose epilogue joins them once per tile (the fused spelling stays a tactic). The
+    32-wide class requantizes by the standalone pass only (the fused epilogue is the 128-wide class's)."""
+    return (
+        block == QBLOCK
+        and not gated
+        and rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
+    )
 
 
 def default_configs_fp8bs(

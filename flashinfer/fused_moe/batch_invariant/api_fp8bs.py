@@ -606,7 +606,7 @@ def fused_moe_fp8bs(
     ).t()  # as [KB, T] (a view; the gather reads its strides)
     if fuse_quant is None:
         fuse_quant = (
-            fused_quant_default(T, k, E) and block == QBLOCK
+            fused_quant_default(T, k, E, gated=w.gated) and block == QBLOCK
             if config1 is None
             else False
         )  # the 32-wide class requantizes by the standalone pass

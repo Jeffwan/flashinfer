@@ -858,9 +858,9 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 and len(set(ranked)) == len(ranked)
                 and all(c in s2 | w2 for c in ranked)
             )
-            assert fused_quant_default(T, k, E) == (
-                rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS
-            )
+            assert not fused_quant_default(T, k, E) and fused_quant_default(
+                T, k, E, gated=False
+            ) == (rows_per_expert(T, k, E) >= FUSED_QUANT_MIN_ROWS)
     # the acceptance: whole scale blocks of every operand
     assert (
         all_valid_configs_fp8bs(2 * 760, 2048, 128, gemm1_chain("silu")) == []
@@ -2060,14 +2060,18 @@ def test_block32_is_its_own_class_with_the_same_chains_and_spaces():
         all_valid_configs_fp8bs(1280, 2560 + 64, 513, gemm1_chain("silu"), block=32)
         == []
     )
-    # the dispatcher's spelling rule: the fused epilogue from 128 rows per expert at 128, never at 32
+    # the dispatcher's spelling rule: the fused epilogue for the ungated chain from 128 rows per expert at 128, never at 32 and
+    # never for the gated chain (its block spans the two promotion warpgroups)
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import fused_quant_default
 
-    assert fused_quant_default(4096, 8, 128) and not fused_quant_default(
+    assert fused_quant_default(4096, 8, 128, gated=False) and not fused_quant_default(
+        4096, 8, 128, 32, gated=False
+    )
+    assert not fused_quant_default(4096, 8, 128) and not fused_quant_default(
         4096, 8, 128, 32
     )
-    assert not fused_quant_default(64, 8, 128) and not fused_quant_default(
-        64, 8, 128, 32
+    assert not fused_quant_default(64, 8, 128, gated=False) and not fused_quant_default(
+        64, 8, 128, 32, gated=False
     )
     for T in (1, 7, 64, 300, 4096):
         for family, sm in (("sm_107", 212), ("sm_100", 148)):

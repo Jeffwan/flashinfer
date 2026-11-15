@@ -207,7 +207,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
         cfg = self.config
         return fused_quant_default(
-            T, cfg.routing.top_k, cfg.routing.num_experts, self._block
+            T,
+            cfg.routing.top_k,
+            cfg.routing.num_experts,
+            self._block,
+            gated=self._activation().gated,
         )
 
     def _default(self, T: int):
