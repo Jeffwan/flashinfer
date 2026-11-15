@@ -166,6 +166,21 @@ def chain_nodes_fp8bs(chain: Fp8BsChain) -> int:
     return chain_nodes(chain)
 
 
+def promotion_overrides_fp8bs(c: Knobs, block: int = QBLOCK) -> dict:
+    """The ranking's promotion terms for one record of the class: blocks per smem stage (the 32-wide class promotes every
+    instruction step) and the swapped body's one promotion warpgroup (half the padded body's two), layered on the dense model's
+    constants (``schedule.record_cost`` overrides; the offline grader `bench/moe_rank_eval.py` prices records with the same)."""
+    from ...gemm.batch_invariant.heuristic import CONSTANTS
+
+    spb = STAGE_K // check_block(block)
+    groups = 1.0 if c.swap_ab else 2.0
+    return dict(
+        promote_handoff_clk=CONSTANTS["promote_handoff_clk"] * spb,
+        promote_pair_clk=CONSTANTS["promote_pair_clk"] * spb,
+        promote_bytes_per_clk=CONSTANTS["promote_bytes_per_clk"] * groups / 2.0 / spb,
+    )
+
+
 def rank_grouped_fp8bs(
     rows: int,
     N: int,
@@ -220,7 +235,6 @@ def _rank_grouped_fp8bs(
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import (
-        CONSTANTS,
         PART_TABLE,
         TOKEN_BOX_ROWS,
         capacity_for,
@@ -248,20 +262,9 @@ def _rank_grouped_fp8bs(
             if can_implement_swapped_fp8bs(c, N, K, E, chain, None, block)
         ]
     )
-    # the promotion term per record family: blocks per smem stage (the 32-wide class promotes every step) and the swapped
-    # body's one promotion warpgroup (half the padded body's two)
-    spb = STAGE_K // block
 
     def promotion_overrides(c: Knobs) -> dict:
-        groups = 1.0 if c.swap_ab else 2.0
-        return dict(
-            promote_handoff_clk=CONSTANTS["promote_handoff_clk"] * spb,
-            promote_pair_clk=CONSTANTS["promote_pair_clk"] * spb,
-            promote_bytes_per_clk=CONSTANTS["promote_bytes_per_clk"]
-            * groups
-            / 2.0
-            / spb,
-        )
+        return promotion_overrides_fp8bs(c, block)
 
     space = dense + swapped
     if not space:
@@ -398,6 +401,7 @@ __all__ = [
     "fused_quant_default",
     "gemm1_chain",
     "grouped_knobs_fp8bs",
+    "promotion_overrides_fp8bs",
     "rank_grouped_fp8bs",
     "chain_nodes_fp8bs",
     "swapped_knobs_fp8bs",
