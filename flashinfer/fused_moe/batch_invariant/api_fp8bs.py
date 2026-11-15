@@ -33,6 +33,7 @@ from ...gemm.batch_invariant.generator import Knobs
 from ...gemm.batch_invariant.spec import BLOCK_K
 from . import spec as S
 from .api import (
+    GATHER_TOKEN_TILE_MAX,
     _check_fused_inputs,
     _check_grouped_chain,
     _check_grouped_operands,
@@ -615,9 +616,13 @@ def fused_moe_fp8bs(
     with the class's chains and rounding (:mod:`.spec_fp8bs`), the ``k`` slots folded in slot order in fp32 and converted once.
     ``config1`` / ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by
     default); ``fuse_quant``: the intermediate's requantization in GEMM1's epilogue (True) or by the standalone pass (False):
-    a placement, the same bytes either way (:func:`.schedule_fp8bs.fused_quant_default` by default). ``plan``:
-    ``route_plan``'s ``(counts, dest, src)``. ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the
-    combine kernel (the pre-routed packed-word convention), as in the bf16 op."""
+    a placement, the same bytes either way (:func:`.schedule_fp8bs.fused_quant_default` by default). ``gather``: GEMM1's
+    gather form (the swapped body reads the token rows and their scales through the plan's map; no routed gather launch) --
+    True / False force it, None applies the bf16 op's rule: a swapped record whose token tile is at most
+    ``GATHER_TOKEN_TILE_MAX``, without the fused requantization (the gather4 instructions per stage grow with the tile; the
+    box form's one launch is the cheaper placement at the wider tiles). ``plan``: ``route_plan``'s ``(counts, dest, src)``.
+    ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the combine kernel (the pre-routed packed-word
+    convention), as in the bf16 op."""
     from .blocks.fp8bs_small import get_compiled_gather_rows_scales
     from .permute import warps_per_row
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
@@ -680,10 +685,15 @@ def fused_moe_fp8bs(
     # the packed row buffers (and their scale columns) carry TAIL_ROWS past Tk so every tile's TMA box stays in bounds (an
     # out-of-bounds box is served far more slowly than the rows it zero-fills); the tail rows are never stored or read back
     Tk_a = Tk + TAIL_ROWS if Tk else 0
-    # GEMM1's gather form: a swapped record reads the token rows and their scales through the plan's map itself (the
-    # routed gather launch is not run); the box form (a grouped record, or ``gather=False``) reads the permuted copies
+    # GEMM1's gather form: a narrow swapped record reads the token rows and their scales through the plan's map itself (the
+    # routed gather launch is not run); the box form (a grouped record, a wide token tile, or ``gather=False``) reads the
+    # permuted copies -- the bf16 op's rule
     if gather is None:
-        gather = bool(config1.swap_ab) and not fuse_quant
+        gather = (
+            bool(config1.swap_ab)
+            and not fuse_quant
+            and config1.tile_n <= GATHER_TOKEN_TILE_MAX
+        )
     if gather and (not config1.swap_ab or fuse_quant):
         raise ValueError(
             "fused_moe_fp8bs: the gather form belongs to GEMM1's swapped records without the fused requantization"
@@ -750,6 +760,7 @@ def fused_moe_fp8bs(
             x_perm=x_perm[:Tk],
             sx_perm=sx_perm[:, :Tk],
             a=None if a is None else a[:Tk],
+            gather=gather,
             aq=aq[:Tk],
             sa=sa[:, :Tk],
             y=y[:Tk],

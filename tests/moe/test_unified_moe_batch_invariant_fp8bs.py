@@ -1136,13 +1136,14 @@ def test_gemm1_gather_form_equals_the_box_form_at_decode():
     """GEMM1's swapped records read the token rows and their scales through the plan's map (the gather form, no routed gather
     launch): the same bits as the box form over the permuted copies, gated and ungated, at a few rows per expert; the fused op
     takes the gather form by default for a swapped GEMM1 record without the fused requantization and refuses it elsewhere."""
-    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.api import GATHER_TOKEN_TILE_MAX, route
     from flashinfer.fused_moe.batch_invariant.api_fp8bs import (
         MoEWeightsE4M3BS,
         fused_moe_fp8bs,
     )
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
         all_valid_configs_fp8bs,
+        all_valid_configs_fp8bs_swapped,
         gemm1_chain,
     )
 
@@ -1162,8 +1163,24 @@ def test_gemm1_gather_form_equals_the_box_form_at_decode():
         dflt, im = fused_moe_fp8bs(xq, sx, ids, wts, W, return_intermediates=True)
         assert torch.equal(bits(box), bits(gat)) and torch.equal(bits(box), bits(dflt))
         assert (
-            im["config1"].swap_ab and not im["fused"]
-        )  # the decode pick: the gather form is the default here
+            im["config1"].swap_ab and not im["fused"] and im["gather"]
+        )  # the decode pick: a narrow swapped record, the gather form the default
+        # a wide swapped token tile takes the box form by default (the bf16 op's rule); its gather form gives the same bits
+        wide = next(
+            c
+            for c in all_valid_configs_fp8bs_swapped(
+                W.w1.shape[1], H, E, gemm1_chain(W.act, W.params, gated)
+            )
+            if c.tile_n > GATHER_TOKEN_TILE_MAX
+        )
+        out_w, im_w = fused_moe_fp8bs(
+            xq, sx, ids, wts, W, config1=wide, return_intermediates=True
+        )
+        assert not im_w["gather"] and torch.equal(bits(out_w), bits(box))
+        assert torch.equal(
+            bits(fused_moe_fp8bs(xq, sx, ids, wts, W, config1=wide, gather=True)),
+            bits(box),
+        )
         # a grouped record has no gather form; nor has the fused requantization
         grouped = next(
             c
