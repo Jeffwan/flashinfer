@@ -255,8 +255,12 @@ class SwappedGroupedGemm:
             self.in_fmt,
         )
         gather = gather or knobs.gather_a
-        assert not gather or self.in_fmt == "bf16" or self.operands.block_scaled, (
-            "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' (the record's flag)",
+        # the chains with their own swapped epilogue (the promoted block-scale fp8 loop, the MX fused requantization) read the
+        # token rows through the box form only: the gather form's per-token map is the generic epilogue's
+        own_loop = self.operands.promoted or chain.swapped_loop() is not None
+        assert not gather or self.in_fmt == "bf16" or (self.operands.block_scaled and not own_loop), (
+            "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' generic-epilogue chains' "
+            "(the record's flag)",
             knobs,
             self.in_fmt,
         )
@@ -273,9 +277,8 @@ class SwappedGroupedGemm:
         self.k_block = k_block
         # the warp roles: the epilogue warpgroup, (the block-scaled formats' scale-factor warp,) the MMA warp, the TMA warp
         bs = self.operands.block_scaled
-        # the chains with their own swapped epilogue (the promoted block-scale fp8 loop, the MX fused requantization) run one
-        # epilogue warpgroup; the generic epilogue splits a wide token tile's subtiles over several
-        own_loop = self.operands.promoted or chain.swapped_loop() is not None
+        # the chains with their own swapped epilogue run one epilogue warpgroup; the generic epilogue splits a wide token
+        # tile's subtiles over several
         self.epi_wgs = 1 if own_loop else epi_warpgroups(self.token_tile)
         self.epilogue_warps = tuple(range(4 * self.epi_wgs))
         self.sf_warp = len(self.epilogue_warps) if bs else None
