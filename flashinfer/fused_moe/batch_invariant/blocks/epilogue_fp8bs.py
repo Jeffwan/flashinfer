@@ -1386,6 +1386,190 @@ def swap_bs_producer_loop(
 
 
 @cute.jit
+def swap_bs_gather_producer_loop(
+    st,
+    k_tile_cnt: Int32,
+    tile_sched,
+    ab_producer,
+    tma_atom_w: cute.CopyAtom,
+    tma_atom_tok: cute.CopyAtom,
+    tWgW: cute.Tensor,
+    tWsW: cute.Tensor,
+    mX: cute.Tensor,
+    mSrc: cute.Tensor,
+    k_div: Int32,
+    sTok: cute.Tensor,
+    Tk: Int32,
+    tn: cutlass.Constexpr,
+    tile_k: cutlass.Constexpr,
+    scale_pipeline,
+    mSFA: cute.Tensor,
+    mSFW: cute.Tensor,
+    sSFA: cute.Tensor,
+    sSFB: cute.Tensor,
+    interleaved: cutlass.Constexpr,
+    block: cutlass.Constexpr,
+):
+    """The gather form of :func:`swap_bs_producer_loop`: the weight tile as there; the token box gathered by the TMA's gather4 mode
+    from the unpermuted rows ``mX (T, K)`` through the plan's map (row ``p`` reads ``mX[mSrc[p] // k_div]``; the rows past the
+    group's end repeat its last row and are never stored), one swizzle atom of K per stage; the token scales of a stage's blocks
+    from the unpermuted scale columns at the same rows (``mSFA (T, KB)``), the weight slot scales as there. The row map is the
+    predecessor's: the first tile's weight stages are issued before the programmatic-dependent-launch wait, the token gathers and
+    the scales after it. Order and staging only: the stage holds the bytes the box form's stage holds."""
+    lane = cute.arch.lane_idx()
+    NB = mSFW.shape[1]
+    wt = st.cta_tile_shape_mnk[0]
+    rows_per_lane = (tn + 31) // 32
+    spb = cute.size(sSFA, mode=[1])
+    NS = cute.size(sSFB, mode=[0])
+    n_stages = cute.size(sSFA, mode=[2])
+    atom_g2s = cute.make_copy_atom(
+        cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=ACC_DTYPE.width
+    )
+    atom_g2s4 = cute.make_copy_atom(
+        cpasync.CopyG2SOp(), ACC_DTYPE, num_bits_per_copy=4 * ACC_DTYPE.width
+    )
+    stage_elems = tn * tile_k
+    sTok_plain = cute.make_tensor(
+        sTok.iterator,
+        cute.make_layout(
+            (tn, tile_k, st.num_ab_stage), stride=(tile_k, 1, stage_elems)
+        ),
+    )  # the atom applies the swizzle
+    sTok_plain = cute.group_modes(sTok_plain, 0, 2)
+    idx = cute.make_rmem_tensor(cute.make_layout((tn,)), Int32)
+    tok_idx = cute.make_rmem_tensor(cute.make_layout((rows_per_lane,)), Int32)
+    gX = cute.local_tile(mX, (tn, tile_k), (0, None))  # (tn, tile_k, n_kt)
+    n_kt = cute.size(gX, mode=[2])
+    scale_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Producer, n_stages
+    )
+    work_tile = tile_sched.initial_work_tile_info()
+    n_pre = cutlass.min(Int32(st.num_ab_stage), k_tile_cnt)
+    if not work_tile.is_valid_tile:
+        n_pre = Int32(0)
+    tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+    ab_producer.reset()
+    tok_producer = ab_producer.clone()
+    for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+        handle = ab_producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_w,
+            tWgW_slice[(None, handle.count)],
+            tWsW[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+    cute.arch.griddepcontrol_wait()  # the row map, the rows and their scales are the predecessor's
+    k_start = n_pre
+    first = Int32(1)
+    while work_tile.is_valid_tile:
+        e = work_tile.e
+        row0 = work_tile.row0
+        n0 = work_tile.n_tile * Int32(wt)
+        tWgW_slice = tWgW[(None, work_tile.n_tile, None, e)]
+        last = cutlass.max(cutlass.min(work_tile.row_end, Tk) - Int32(1), Int32(0))
+        for j in cutlass.range_constexpr(tn):
+            idx[j] = mSrc[cutlass.min(row0 + Int32(j), last)] // k_div
+        for r in cutlass.range_constexpr(rows_per_lane):
+            tok_idx[r] = mSrc[cutlass.min(row0 + Int32(r * 32) + lane, last)] // k_div
+        gI = cute.make_tensor(
+            idx.iterator, cute.make_layout((tn, tile_k, n_kt), stride=(1, 0, 0))
+        )
+        tTsTok, tTgX, tTgI = cpasync.tma_partition(
+            tma_atom_tok,
+            0,
+            cute.make_layout(1),
+            sTok_plain,
+            [cute.group_modes(gX, 0, 2), cute.group_modes(gI, 0, 2)],
+        )
+        nbs = slot_blocks(n0, NB, NS, block, interleaved)
+        if first == 1:
+            for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+                handle = tok_producer.current_handle()
+                cute.copy(
+                    tma_atom_tok,
+                    [tTgX[(None, handle.count)], tTgI[(None, handle.count)]],
+                    tTsTok[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                )
+                tok_producer.advance()
+                scale_pipeline.producer_acquire(scale_state)
+                swap_bs_stage_scales(
+                    lane,
+                    handle.count,
+                    scale_state.index,
+                    row0,
+                    Tk,
+                    e,
+                    nbs,
+                    mSFA,
+                    mSFW,
+                    sSFA,
+                    sSFB,
+                    atom_g2s,
+                    atom_g2s4,
+                    tn,
+                    rows_per_lane,
+                    spb,
+                    NS,
+                    tok_idx=tok_idx,
+                )
+                scale_pipeline.producer_commit(scale_state)
+                scale_state.advance()
+        first = Int32(0)
+        peek_empty = cutlass.Boolean(1)
+        if k_start < k_tile_cnt:
+            peek_empty = ab_producer.try_acquire()
+        for _k_tile in cutlass.range(k_start, k_tile_cnt, 1, unroll=1):
+            handle = ab_producer.acquire_and_advance(peek_empty)
+            cute.copy(
+                tma_atom_w,
+                tWgW_slice[(None, handle.count)],
+                tWsW[(None, handle.index)],
+                tma_bar_ptr=handle.barrier,
+            )
+            cute.copy(
+                tma_atom_tok,
+                [tTgX[(None, handle.count)], tTgI[(None, handle.count)]],
+                tTsTok[(None, handle.index)],
+                tma_bar_ptr=handle.barrier,
+            )
+            scale_pipeline.producer_acquire(scale_state)
+            swap_bs_stage_scales(
+                lane,
+                handle.count,
+                scale_state.index,
+                row0,
+                Tk,
+                e,
+                nbs,
+                mSFA,
+                mSFW,
+                sSFA,
+                sSFB,
+                atom_g2s,
+                atom_g2s4,
+                tn,
+                rows_per_lane,
+                spb,
+                NS,
+                tok_idx=tok_idx,
+            )
+            scale_pipeline.producer_commit(scale_state)
+            scale_state.advance()
+            peek_empty = cutlass.Boolean(1)
+            if handle.count + 1 < k_tile_cnt:
+                peek_empty = ab_producer.try_acquire()
+        ab_producer.reset()
+        k_start = Int32(0)
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+    pdl.trigger_late()
+    ab_producer.tail()
+    scale_pipeline.producer_tail(scale_state)
+
+
+@cute.jit
 def swap_bs_stage_scales(
     lane,
     kt,
@@ -1404,15 +1588,20 @@ def swap_bs_stage_scales(
     rows_per_lane: cutlass.Constexpr,
     spb: cutlass.Constexpr,
     NS: cutlass.Constexpr,
+    tok_idx=None,
 ):
     """One ring stage's copies for smem stage ``kt`` (scale blocks ``kt * spb ..``): the tile's token scales per block (lanes ``j <
-    tn``, the row clamped to the buffer) and the weight tile's slot scales (lanes ``t < NS``; the four blocks of a slot one 16-byte
-    copy at ``spb = 4``: the weight scales are K-contiguous and ``K / 32`` a multiple of four)."""
+    tn``, the row clamped to the buffer; in the gather form ``tok_idx[r]``, the lane's token row of the unpermuted scales) and the
+    weight tile's slot scales (lanes ``t < NS``; the four blocks of a slot one 16-byte copy at ``spb = 4``: the weight scales are
+    K-contiguous and ``K / 32`` a multiple of four)."""
     kb0 = kt * Int32(spb)
     for r in cutlass.range_constexpr(rows_per_lane):
         j = r * 32 + lane
         if j < tn:
-            row = cutlass.min(row0 + j, R - Int32(1))
+            if cutlass.const_expr(tok_idx is not None):
+                row = tok_idx[r]
+            else:
+                row = cutlass.min(row0 + j, R - Int32(1))
             for jb in cutlass.range_constexpr(spb):
                 cute.copy(
                     atom_g2s,

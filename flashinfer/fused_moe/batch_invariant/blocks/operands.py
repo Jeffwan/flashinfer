@@ -94,6 +94,7 @@ from .epilogue_fp8bs import (
     grouped_scale_ring_bytes,
     n_scale_slots,
     swap_bs_epilogue_loop,
+    swap_bs_gather_producer_loop,
     swap_bs_mma_loop,
     swap_bs_producer_loop,
     swap_scale_ring_bytes,
@@ -592,11 +593,11 @@ class PromotedOperands:
         return sfa, sfb
 
     def producer_loop(self, body: str):
-        return (
-            grouped_blockscale_producer_loop
-            if body == "grouped"
-            else swap_bs_producer_loop
-        )
+        if body == "grouped":
+            return grouped_blockscale_producer_loop
+        if body == "gather":
+            return swap_bs_gather_producer_loop
+        return swap_bs_producer_loop
 
     def mma_loop_fn(self, body: str):
         return grouped_blockscale_mma_loop if body == "grouped" else swap_bs_mma_loop

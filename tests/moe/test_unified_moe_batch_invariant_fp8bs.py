@@ -600,9 +600,13 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     """The block-scale fp8 chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts
     under the chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the
     body's own wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the
-    gather form belongs to the bf16 classes; the block-scaled k-block is not this format's."""
+    gather form (GEMM1's token rows through the plan's map, its own producer) takes the bf16 / f32 chains and refuses the
+    fused requantization; the block-scaled k-block is not this format's."""
     from flashinfer.fused_moe.batch_invariant import pdl
-    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import GEMM2_CHAIN
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue_fp8bs import (
+        GEMM2_CHAIN,
+        gemm1_chain,
+    )
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import swapped_knobs_fp8bs
 
@@ -610,8 +614,10 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
     SwappedGroupedGemm(cfg, GEMM2_CHAIN)
     SwappedGroupedGemm(cfg, GEMM2_CHAIN.at(32))
+    assert SwappedGroupedGemm(cfg, GEMM2_CHAIN, gather=True).gather
+    assert SwappedGroupedGemm(cfg, gemm1_chain("silu"), gather=True).gather
     with pytest.raises(AssertionError):
-        SwappedGroupedGemm(cfg, GEMM2_CHAIN, gather=True)
+        SwappedGroupedGemm(cfg, gemm1_chain("silu", fused=True), gather=True)
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(cfg, GEMM2_CHAIN, k_block=256)
     monkeypatch.setattr(pdl, "TRIGGER", "early")
@@ -1123,6 +1129,54 @@ def test_input_quantization_is_the_class_on_the_device():
     q_fi, s_fi = TrtllmFp8BlockConfig.prepare_activations(x, quant=QUANT)
     out_fi = layer(_logits_pack(q_fi, s_fi, logits), W)
     assert out_fi.shape == (T, H) and torch.isfinite(out_fi.float()).all()
+
+
+@needs_device
+def test_gemm1_gather_form_equals_the_box_form_at_decode():
+    """GEMM1's swapped records read the token rows and their scales through the plan's map (the gather form, no routed gather
+    launch): the same bits as the box form over the permuted copies, gated and ungated, at a few rows per expert; the fused op
+    takes the gather form by default for a swapped GEMM1 record without the fused requantization and refuses it elsewhere."""
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.api_fp8bs import (
+        MoEWeightsE4M3BS,
+        fused_moe_fp8bs,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8bs import (
+        all_valid_configs_fp8bs,
+        gemm1_chain,
+    )
+
+    for gated in (True, False):
+        T, k, H, I, E = 7, 4, 512, 256, 32
+        x, logits, w1, w2 = _problem(
+            T, k, H, I, E, seed=31, gated=gated, adversarial=True
+        )
+        xq, sx = _xq(x)
+        view = BatchInvariantFp8BlockConfig.prepare_weights(
+            w1, w2, quant=QUANT, activation=SwiGLU() if gated else ReLU2()
+        )
+        W = MoEWeightsE4M3BS.from_view(view)
+        ids, wts = route(logits, k)
+        box = fused_moe_fp8bs(xq, sx, ids, wts, W, gather=False)
+        gat = fused_moe_fp8bs(xq, sx, ids, wts, W, gather=True)
+        dflt, im = fused_moe_fp8bs(xq, sx, ids, wts, W, return_intermediates=True)
+        assert torch.equal(bits(box), bits(gat)) and torch.equal(bits(box), bits(dflt))
+        assert (
+            im["config1"].swap_ab and not im["fused"]
+        )  # the decode pick: the gather form is the default here
+        # a grouped record has no gather form; nor has the fused requantization
+        grouped = next(
+            c
+            for c in all_valid_configs_fp8bs(
+                W.w1.shape[1], H, E, gemm1_chain(W.act, W.params, gated)
+            )
+            if not c.swap_ab
+        )
+        with pytest.raises(ValueError):
+            fused_moe_fp8bs(xq, sx, ids, wts, W, config1=grouped, gather=True)
+        if gated:
+            with pytest.raises(ValueError):
+                fused_moe_fp8bs(xq, sx, ids, wts, W, fuse_quant=True, gather=True)
 
 
 @needs_device

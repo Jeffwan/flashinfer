@@ -255,6 +255,22 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         f["out_sf"] = cute.runtime.make_fake_tensor(
             Float32, (sym_ob, cute.sym_int(32)), (cute.sym_int64(), 1), assumed_align=4
         )
+        # the gather form's unpermuted rows and their scales (any strides), the plan's row map
+        f["x"] = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_r, sym_k),
+            (cute.sym_int64(divisibility=al), 1),
+            assumed_align=16,
+        )
+        f["sfa_u"] = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_r, sym_kb),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        f["src"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
         return f
     if _is_block_scaled(chain):
         dense_a = packing == "dense"
@@ -644,6 +660,22 @@ def compile_swapped_fn(
                 f["counts"],
                 f["alpha"],
                 f["pts_any"],
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+        if _is_promoted(chain) and gather:
+            # the block-scale fp8 gather form: the unpermuted rows and scales through the plan's map (the bf16 / f32 chains)
+            return cute.compile(
+                body.promoted_gathered,
+                f["x"],
+                f["sfa_u"],
+                f["src"],
+                Int32(1),
+                f["b"],
+                f["sfb"],
+                f["out"],
+                f["counts"],
                 grid,
                 stream_fake,
                 options="--enable-tvm-ffi",

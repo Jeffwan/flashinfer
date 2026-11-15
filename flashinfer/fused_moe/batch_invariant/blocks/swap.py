@@ -225,7 +225,8 @@ class SwappedGroupedGemm:
     rows as a narrow TMA box on its B side. The persistent grid (``max_active_clusters``, in CTAs) is a dynamic launch argument:
     which CTA computes a tile, never the bits. The chain's operand format selects the operand block and the record space; a
     chain with scale operands launches through :meth:`with_scales`, the block-scaled chains through :meth:`block_scaled` /
-    :meth:`block_scaled_static`; the gather form belongs to the bf16 classes."""
+    :meth:`block_scaled_static`; the gather form is the bf16 and the block-scale fp8 classes' (the API's choice) and the
+    block-scaled classes' (the record's flag)."""
 
     def __init__(
         self,
@@ -255,22 +256,28 @@ class SwappedGroupedGemm:
             self.in_fmt,
         )
         gather = gather or knobs.gather_a
-        # the chains with their own swapped epilogue (the promoted block-scale fp8 loop, the MX fused requantization) read the
-        # token rows through the box form only: the gather form's per-token map is the generic epilogue's
+        # the MX fused requantization reads the token rows through the box form only (the gather form's per-token map is the
+        # generic epilogue's); the promoted block-scale fp8 loop has its own gather producer (the API's choice, as the bf16 form)
         own_loop = self.operands.promoted or chain.swapped_loop() is not None
         assert (
             not gather
             or self.in_fmt == "bf16"
+            or self.operands.promoted
             or (self.operands.block_scaled and not own_loop)
         ), (
-            "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' generic-epilogue chains' "
-            "(the record's flag)",
+            "the gather form is the bf16 and the block-scale fp8 classes' (the API's choice) and the block-scaled classes' "
+            "generic-epilogue chains' (the record's flag)",
             knobs,
             self.in_fmt,
         )
         assert not knobs.gather_a or self.operands.block_scaled, (
             "the gather record is the block-scaled classes'",
             knobs,
+        )
+        # the fused requantization's code stores need the permuted rows' positions the box form carries
+        assert not (gather and self.operands.promoted and chain.quant), (
+            "the block-scale fp8 gather form takes the bf16 / f32 chains; the fused requantization reads the box form",
+            chain,
         )
         assert sf_src in ("128x4", "linear"), sf_src
         self.knobs, self.chain, self.gather, self.sf_src = knobs, chain, gather, sf_src
@@ -357,6 +364,37 @@ class SwappedGroupedGemm:
         """The gather form: ``x (T, K)`` the unpermuted rows, ``src (>= Tk,)`` int32 the plan's slot of every expanded row."""
         assert self.gather
         self._launch(x, w, out, counts, max_active_clusters, stream, src, k_div)
+
+    @cute.jit
+    def promoted_gathered(
+        self,
+        x: cute.Tensor,
+        sfa: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form of :meth:`block_scaled_plain` for the block-scale fp8 chains: ``x (T, K)`` the unpermuted e4m3 rows,
+        ``sfa (T, KB)`` their fp32 block scales (any strides), ``src (>= Tk,)`` int32 the plan's slot of every dense row, ``k_div``
+        the slots per token; ``w`` / ``sfw`` the experts and their block scales; ``out (Tk, Nout)`` sizes the dense rows."""
+        assert self.gather and self.operands.promoted and not self.chain.quant
+        self._launch(
+            x,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            src,
+            k_div,
+            sfa=sfa,
+            sfw=sfw,
+        )
 
     @cute.jit
     def block_scaled(
@@ -1093,7 +1131,32 @@ class SwappedGroupedGemm:
             tile_sched = GroupScheduler.create(
                 s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
-            if cutlass.const_expr(self.gather):
+            if cutlass.const_expr(self.gather and pr):
+                ops.producer_loop("gather")(
+                    st,
+                    k_tile_cnt,
+                    tile_sched,
+                    ab_producer,
+                    tma_atom_w,
+                    tma_atom_tok,
+                    tWgW,
+                    tWsW,
+                    mTok_nkl,
+                    mSrc,
+                    k_div,
+                    sTok,
+                    Tk,
+                    tn,
+                    st.cta_tile_shape_mnk[2],
+                    scale_pipeline,
+                    mSFA_flat,
+                    mSFW_mkl,
+                    sSFA32,
+                    sSFB32,
+                    ops.interleaved,
+                    ops.block,
+                )
+            elif cutlass.const_expr(self.gather):
                 swap_gather_producer_loop(
                     st,
                     k_tile_cnt,

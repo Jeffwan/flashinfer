@@ -455,21 +455,39 @@ def grouped_gemm_fp8bs(
     out: Optional[torch.Tensor] = None,
     sfo: Optional[torch.Tensor] = None,
     interleaved: Optional[bool] = None,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
+    rows_out: Optional[int] = None,
 ):
     """``out[p] = chain( fold_kb fma(mul(sfa[p, kb], w_sf[e(p), blk(n), kb]), P_kb, acc) )`` on the dense expert segments
     ``counts``: ``a [Tk, K]`` e4m3, ``sfa [K / block, Tk]`` fp32 (MN; or ``[Tk, K / block]``), ``w [E, N, K]`` e4m3, ``w_sf [E, N /
     block, K / block]`` fp32 -- the block (128 or 32: the class) is read off the weight scales' shape. ``chain``: the bf16 / f32
     chains (one tensor returned) or the fused requantization (``out_fmt = "e4m3bs"``, the 128-wide class: ``(codes [Tk, Nout]
     float8_e4m3fn, scales [Nout / 128, Tk] fp32)``). ``interleaved``: the weight's rows are gate / up interleaved (default: the
-    chain's pairing; the f32 oracle output of GEMM1 reads the interleaved weight with the plain chain). The persistent grid is a
-    launch argument, the device's capacity clipped to the launch's tile bound (`schedule.launch_tile_bound`: which CTA computes a
-    tile, never the bits)."""
+    chain's pairing; the f32 oracle output of GEMM1 reads the interleaved weight with the plain chain). ``src``: the gather form
+    of a swapped record (the bf16 / f32 chains): ``a [T, K]`` and ``sfa`` are then the unpermuted token rows and their scales, dense
+    row ``p`` reads token ``src[p] // k_div`` (the plan's slot map, ``k_div`` the slots per token), ``rows_out`` the dense rows of
+    ``out`` (``Tk`` plus the tail). The persistent grid is a launch argument, the device's capacity clipped to the launch's tile
+    bound (`schedule.launch_tile_bound`: which CTA computes a tile, never the bits)."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
     from .schedule_fp8bs import (
         can_implement_grouped_fp8bs,
         can_implement_swapped_fp8bs,
     )
 
+    gather = src is not None
+    if gather and (
+        not config.swap_ab
+        or chain.out_fmt == OUT_FMT_QUANT
+        or rows_out is None
+        or src.dtype != torch.int32
+        or not src.is_contiguous()
+        or k_div < 1
+    ):
+        raise ValueError(
+            "grouped_gemm_fp8bs: the gather form takes a swapped record, a bf16 / f32 chain, an int32 contiguous src, "
+            "k_div >= 1 and rows_out"
+        )
     # the shared operand rules at the class's alignment: K in whole smem stages of scale blocks, every row 16 bytes
     _, K, E, N, Tk = _check_grouped_operands(
         "grouped_gemm_fp8bs",
@@ -484,6 +502,11 @@ def grouped_gemm_fp8bs(
         k_align=BLOCK_K,
         n_align=ALIGN_E4M3,
     )
+    if gather:
+        # the gather form's dense rows are the output's (``a`` holds the tokens, fewer than the expanded rows)
+        if rows_out < 0 or src.shape[0] < rows_out - TAIL_ROWS:
+            raise ValueError("grouped_gemm_fp8bs: rows_out and src disagree")
+        Tk = int(rows_out)
     block = MoEWeightsE4M3BS.block_of(w, w_sf)
     KB, NB = K // block, N // block
     if (
@@ -504,7 +527,7 @@ def grouped_gemm_fp8bs(
         raise ValueError(
             f"grouped_gemm_fp8bs: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()}, interleaved={interleaved}, block={block})"
         )
-    sfa_v = scale_mn_view(sfa, KB, Tk, "sfa", block)
+    sfa_v = scale_mn_view(sfa, KB, a.shape[0] if gather else Tk, "sfa", block)
     n_out = _check_grouped_chain("grouped_gemm_fp8bs", N, chain)
     quant = chain.out_fmt == OUT_FMT_QUANT
     if quant:
@@ -532,7 +555,20 @@ def grouped_gemm_fp8bs(
         )  # the scale output is unread: any fp32 (1, 1) tensor
     # the unified bodies on the promoted operand block: the chain carries the class's block and the weight interleave
     body_chain = chain.at(block, interleaved)
-    if Tk and config.swap_ab:
+    if Tk and gather:
+        # the swapped body's gather form: the unpermuted rows and their scales through the plan's map, the same bits
+        get_compiled_swapped(config, body_chain, gather=True)(
+            a,
+            sfa_v,
+            src,
+            k_div,
+            w.permute(1, 2, 0),
+            w_sf,
+            out_k,
+            counts,
+            launch_grid(a.device, config, Tk, E, N),
+        )
+    elif Tk and config.swap_ab:
         # the swapped body: the same operands, the same bits (no fused requantization output)
         get_compiled_swapped(config, body_chain)(
             a.unsqueeze(-1),
@@ -570,6 +606,7 @@ def fused_moe_fp8bs(
     config2: Optional[Knobs] = None,
     fuse_quant: Optional[bool] = None,
     return_intermediates: bool = False,
+    gather: Optional[bool] = None,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     w_round: bool = False,
 ):
@@ -643,9 +680,17 @@ def fused_moe_fp8bs(
     # the packed row buffers (and their scale columns) carry TAIL_ROWS past Tk so every tile's TMA box stays in bounds (an
     # out-of-bounds box is served far more slowly than the rows it zero-fills); the tail rows are never stored or read back
     Tk_a = Tk + TAIL_ROWS if Tk else 0
+    # GEMM1's gather form: a swapped record reads the token rows and their scales through the plan's map itself (the
+    # routed gather launch is not run); the box form (a grouped record, or ``gather=False``) reads the permuted copies
+    if gather is None:
+        gather = bool(config1.swap_ab) and not fuse_quant
+    if gather and (not config1.swap_ab or fuse_quant):
+        raise ValueError(
+            "fused_moe_fp8bs: the gather form belongs to GEMM1's swapped records without the fused requantization"
+        )
     x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
     sx_perm = torch.empty(KB, Tk_a, dtype=torch.float32, device=dev)
-    if Tk:
+    if Tk and (not gather or return_intermediates):
         # the e4m3 rows and their scale columns to the expanded rows in one launch (a copy)
         get_compiled_gather_rows_scales(
             k, warps_per_row(Tk, H // 16, sm_count_of(dev))
@@ -665,9 +710,26 @@ def fused_moe_fp8bs(
             x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
         )  # [Tk_a, I] e4m3 + [I / 128, Tk_a]
     else:
-        a = grouped_gemm_fp8bs(
-            x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
-        )  # [Tk_a, I] bf16
+        if gather:
+            a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
+            if Tk:
+                grouped_gemm_fp8bs(
+                    xq,
+                    sx_kt,
+                    w.w1,
+                    w.w1_sf,
+                    counts,
+                    config1,
+                    chain1,
+                    out=a,
+                    src=src.reshape(-1),
+                    k_div=k,
+                    rows_out=Tk_a,
+                )  # [Tk_a, I] bf16: the unpermuted rows through the plan's map
+        else:
+            a = grouped_gemm_fp8bs(
+                x_perm, sx_perm, w.w1, w.w1_sf, counts, config1, chain1
+            )  # [Tk_a, I] bf16
         aq = torch.empty(Tk_a, I, dtype=torch.float8_e4m3fn, device=dev)
         sa = torch.empty(I // block, Tk_a, dtype=torch.float32, device=dev)
         if Tk:
