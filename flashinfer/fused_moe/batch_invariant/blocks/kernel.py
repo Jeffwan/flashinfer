@@ -654,6 +654,14 @@ class GroupedBlockGemm:
                 layout=self.chain.smem_layout(self.epi_warpgroups),
                 byte_alignment=16,
             )
+        sQ = None
+        if cutlass.const_expr(self.chain.stage_layout() is not None):
+            # a quantising chain's staging rows (the fused requantization's code stores, one round of rows per promotion warp)
+            sQ = smem.allocate_tensor(
+                element_type=cutlass.Uint8,
+                layout=self.chain.stage_layout(),
+                byte_alignment=128,
+            )
         sC = None
         if cutlass.const_expr(self.staged):  # one output subtile per epilogue warpgroup
             if cutlass.const_expr(
@@ -976,6 +984,7 @@ class GroupedBlockGemm:
                     sC,
                     sX,
                     ops.block,
+                    sQ=sQ,
                 )
             elif cutlass.const_expr(quant_loop is not None):
                 # a quantising chain's own epilogue (the MXFP8 classes' fused requantization: the codes and the 128x4 block

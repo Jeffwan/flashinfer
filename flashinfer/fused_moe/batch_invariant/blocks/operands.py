@@ -97,6 +97,7 @@ from .epilogue_fp8bs import (
     swap_bs_mma_loop,
     swap_bs_producer_loop,
     swap_scale_ring_bytes,
+    code_stage_bytes,
     xch_floats,
 )
 from .scheduler import EPI_WARPGROUPS_DENSE, MAX_E
@@ -525,9 +526,10 @@ class PromotedOperands:
 
     @property
     def xch_reserve_bytes(self) -> int:
-        """The fused requantization's half-block amax exchange, held back from the grouped ring for every chain: the quantising
-        and the plain spellings of a record share one plan (one ring depth per record)."""
-        return 4 * xch_floats()
+        """The fused requantization's half-block amax exchange and its code staging rows (the 128-wide class's), held back from
+        the grouped ring for every chain of the class: the quantising and the plain spellings of a record share one plan (one
+        ring depth per record)."""
+        return 4 * xch_floats() + (code_stage_bytes() if self.block == QBLOCK else 0)
 
     def scale_ring_bytes(self, knobs: Knobs, body: str) -> int:
         """Smem of the fp32 scale ring: per stage the tile's row (token) scales and its weight slot scales, ``spb`` blocks each."""

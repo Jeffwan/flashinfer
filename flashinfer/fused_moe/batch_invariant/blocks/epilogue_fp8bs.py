@@ -18,8 +18,10 @@ output), or the fused requantization (``out_fmt = "e4m3bs"``): the chain's bf16-
 ``inv = div(1, s)``, ``cvt.rn.satfinite.e4m3(mul(y, inv))``) with the e4m3 codes to ``out`` (uint8) and the fp32 scales to
 ``sfo (Nout / 128, Tk)`` (the MN layout GEMM2's ring reads). A block of 128 outputs lies inside one tile (the fused chain's
 acceptance: the tile's outputs are whole blocks); its two 64-output halves land in the two promotion warpgroups, which exchange
-their half-block amax through shared memory (the chain's ``smem_layout``; one named barrier per tile; the canonical tree over 128
-leaves is the combine of the two halves' trees), or one warpgroup holds a whole block (the ungated chain on the 256-wide tile).
+their half-block amax through shared memory (the chain's ``smem_layout``; one named barrier per tile between the two warps holding
+the same rows; the rounded outputs are kept as packed bf16 pairs and the amax is folded as they form: max is exact in every order, so
+the fold is the canonical tree's value and the block's is the combine of the two halves'), or one warpgroup holds a whole block (the
+ungated chain on the 256-wide tile).
 
 The 32-wide class (``block = 32``, the dense core ``gemm.e4m3.kblock32``) runs on the same bodies with the block as the operand
 block's parameter: a 128-element smem stage holds ``spb = 4`` blocks, the MMA warp commits every instruction step to its own
@@ -50,17 +52,17 @@ from typing import Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Float32, Int32, Uint8, Uint32
+from cutlass import Float32, Int32, Uint32
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from ....batch_invariant.canon import _pairwise
 from ....batch_invariant.fp_interface.exact import f32_bits
 from ....batch_invariant.quantization.blocks import pack_block_codes
-from ....batch_invariant.quantization.cute_ext import CuteF32
+from ....batch_invariant.quantization.cute_ext import CuteF32, bitcast_i32_to_f32
 from ....gemm.batch_invariant.blocks.blockscale_fp8 import (
     NUM_PROMO_GROUPS,
+    NUM_PROMO_WARPS,
     NUM_SCALE_STAGES,
     PROMO_BATCH,
     _elem,
@@ -71,7 +73,16 @@ from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ....gemm.batch_invariant.generator import Knobs
 from ....gemm.batch_invariant.spec import BLOCK_K
 from .. import pdl
-from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS, act_elem, glu_elem, params_key
+from ..spec import (
+    ACT_PARAMS,
+    ACTS,
+    UNGATED_ACTS,
+    act_elem,
+    glu_elem,
+    glu_pre,
+    params_key,
+    ungated_term,
+)
 from ..spec_fp8bs import BLOCK as QBLOCK
 from ..spec_fp8bs import block_chain, check_block, elem_digit, leaf_value, quant_pre
 from .epilogue import (
@@ -93,10 +104,9 @@ KINDS = ("plain", "glu", "act")
 #: The grouped space's N tiles: two promotion warpgroups each own a contiguous column half (the narrow decode tiles have one subtile).
 TILES_N_GROUPED = (64, 128, 256)
 XCH_BUFFERS = 2  # the half-block amax exchange, double-buffered by tile parity (one barrier per tile)
-BAR_XCH = 8  # the exchange's named barrier (both promotion warpgroups)
-BAR_PROMO_JOIN = (
-    BAR_XCH + 1
-)  # both promotion warpgroups once, after their last TMEM loads, before the TMEM free
+BAR_PROMO_JOIN = 9  # both promotion warpgroups once, after their last TMEM loads, before the TMEM free
+BAR_XCH = 10  # named barrier ids BAR_XCH + warp: the amax exchange of the two promotion warps holding the same rows
+CODE_STAGE_BYTES = 1024  # per promotion warp: one round of rows of the fused requantization's staged code stores
 VEC_BYTES = 16
 #: The scale ring's depth in smem stages per class: the 128-wide class's (one block per stage) and the 32-wide class's (four
 #: blocks per stage: a stage holds four times the scales, so fewer stages hold as many blocks ahead).
@@ -282,6 +292,11 @@ class Fp8BsChain(GroupedEpilogueBlock):
             return None
         return cute.make_layout((XCH_BUFFERS, epi_warpgroups, 128))
 
+    def stage_layout(self):
+        """The fused requantization's code staging (bytes per promotion warp): the codes of a round of rows go through the
+        warp's smem rows so consecutive lanes store whole 16-byte chunks of one row."""
+        return code_stage_layout() if self.quant else None
+
     def record_ok(self, knobs: Knobs) -> bool:
         """The grouped records the promoted body takes: a tile of two promotion warpgroups (N 64 / 128 / 256) and, for the
         fused requantization, the 128-wide class's tiles whose outputs are whole 128-column blocks."""
@@ -351,6 +366,17 @@ def xch_floats() -> int:
     return XCH_BUFFERS * NUM_PROMO_GROUPS * 128
 
 
+def code_stage_bytes() -> int:
+    """Smem of the fused requantization's code staging: one round of rows per promotion warp."""
+    return NUM_PROMO_WARPS * CODE_STAGE_BYTES
+
+
+def code_stage_layout():
+    return cute.make_layout(
+        (NUM_PROMO_WARPS, CODE_STAGE_BYTES), stride=(CODE_STAGE_BYTES, 1)
+    )  # a warp's rows contiguous
+
+
 def quant_twin(chain: Fp8BsChain) -> Fp8BsChain:
     """The bf16 chain whose rounded output the fused requantization quantizes."""
     assert chain.out_fmt == OUT_FMT_QUANT, chain
@@ -367,6 +393,37 @@ def fused_quant_ok(chain: Fp8BsChain, tile_n: int) -> bool:
 def _chain_elem_bs(chain: Fp8BsChain, acc, acc_gate):
     """One output element of a bf16 / f32 chain through ``MoeF32`` (the chain's own ``elem``)."""
     return chain.elem(MoeF32, acc, acc_gate)
+
+
+def _chain_pre_bs(chain: Fp8BsChain, acc, acc_gate):
+    """The chain's value before its bf16 rounding (``glu_pre`` / ``ungated_term`` through ``MoeF32``): the fused requantization
+    rounds two of them with one packed conversion, RNE per element like ``cvt_out``."""
+    if chain.pair:
+        return glu_pre(MoeF32, acc_gate, acc, chain.act, chain.params)
+    assert chain.kind == "act", chain
+    return ungated_term(MoeF32, chain.act, acc)
+
+
+def pack_bf16x2(lo, hi):
+    """``cvt.rn.bf16x2.f32``: two values rounded to bf16 (RNE, no saturation) in one word, ``lo`` in the low half."""
+    from cutlass._mlir.dialects import llvm
+    from cutlass.cutlass_dsl import T
+
+    res = llvm.inline_asm(
+        T.i32(),
+        [Float32(hi).ir_value(), Float32(lo).ir_value()],
+        "cvt.rn.bf16x2.f32 $0, $1, $2;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(res)
+
+
+def unpack_bf16x2(w):
+    """The word's two bf16 halves widened to f32 (exact: a shift and a mask of the bit pattern), ``(lo, hi)``."""
+    return bitcast_i32_to_f32(w << 16), bitcast_i32_to_f32(w & Int32(-65536))
 
 
 # ---- the grouped body's loops
@@ -587,12 +644,13 @@ def block_combine(a, b):
     return elem_digit().combine(CuteF32, a, b)
 
 
-def block_amax_tree(fp, ys):
-    """The quantizer's block reduction on one thread's consecutive output values: ``fabs`` leaves, the ``elem`` digit's pairwise
-    ``fmaxc`` tree (the canonical order of ``spec_fp8bs.block_reduction``); on a half block the subtree whose combine with the
-    other half's is the block's tree."""
+def block_amax_fold(fp, amax, lo, hi):
+    """The ``elem`` digit's combine of a thread's running amax with a rounded pair's ``fabs`` leaves (``None`` starts it): max is
+    exact in every order, so the fold over the thread's pairs is the value of the canonical pairwise tree
+    (``spec_fp8bs.block_reduction``); on a half block the subtree whose combine with the other half's is the block's."""
     d = elem_digit()
-    return _pairwise([leaf_value(fp, y) for y in ys], lambda a, b: d.combine(fp, a, b))
+    a = d.combine(fp, leaf_value(fp, lo), leaf_value(fp, hi))
+    return a if amax is None else d.combine(fp, amax, a)
 
 
 @cute.jit
@@ -620,6 +678,7 @@ def grouped_blockscale_epilogue_loop(
     sC: cute.Tensor = None,
     sX: cute.Tensor = None,
     block: cutlass.Constexpr = QBLOCK,
+    sQ: cute.Tensor = None,
 ):
     """The promotion (the dense body's: two warpgroups, each a contiguous column half of the tile, the block partials folded
     with packed fmas into a register running sum, one accumulator stage released per block, one scale ring stage per smem
@@ -633,9 +692,10 @@ def grouped_blockscale_epilogue_loop(
     out_dt = mOut.element_type
     g = warp_idx // 4  # this warp's promotion group
     tidx_g = tidx % 128
-    warp_row0 = Int32(32) * (
+    warp_q = (
         (tidx_g // Int32(32)) % Int32(4)
-    )  # the first tile row of this warp's TMEM lanes
+    )  # this warp's TMEM lane quadrant: its rows, shared with one warp of the other group
+    warp_row0 = Int32(32) * warp_q  # the first tile row of this warp's TMEM lanes
     tiler_mn = cute.slice_(st.mma_tiler, (None, None, 0))
     tn = st.mma_tiler[1]
     cta_m = st.cta_tile_shape_mnk[0]
@@ -716,6 +776,9 @@ def grouped_blockscale_epilogue_loop(
         if is_out[v]
     }
     V_out = len(out_col)
+    assert [out_col[v] for v in range(V) if is_out[v]] == list(range(V_out)) and (
+        V_out % 2 == 0
+    ), out_col  # a subtile's outputs form in column order: consecutive pairs
     OUT_G = per_group * V_out  # this group's output columns
     # the stores
     tTR_rC = cute.make_rmem_tensor(frag.shape, out_dt)
@@ -817,10 +880,10 @@ def grouped_blockscale_epilogue_loop(
         tCcC = transform_partitioned_tensor_layout(thr_mma.partition_C(cC))
         cC_epi = cute.flat_divide(tCcC, epi_tile)
         tRG_cC_all = thr_r2g.partition_D(cC_epi)
-    # -- the fused requantization: the group's outputs, bf16-rounded and widened, the block amax (a half or a whole block)
+    # -- the fused requantization: the group's outputs, bf16-rounded in packed pairs, the block amax (a half or a whole block)
     SB = 1
     blocks_per_tile = 1
-    ys_r = fy_words = fy = None
+    yw = fy_words = None
     if cutlass.const_expr(quant):
         tile_outs = tn // 2 if pair else tn
         assert (
@@ -833,18 +896,30 @@ def grouped_blockscale_epilogue_loop(
             and blocks_per_tile * QBLOCK == tile_outs
             and (SB == 1 or blocks_per_tile == 1)
         )
-        ys_r = cute.make_rmem_tensor(
-            cute.make_layout((OUT_G,)), Float32
-        )  # the group's bf16-rounded outputs, widened
+        yw = cute.make_rmem_tensor(
+            cute.make_layout((OUT_G // 2,)), Int32
+        )  # the group's bf16-rounded outputs, packed in pairs
         fy_words = cute.make_rmem_tensor(
             cute.make_layout((OUT_G // 4,)), Uint32
         )  # their e4m3 codes as words
-        fy = cute.make_tensor(
-            cute.recast_ptr(fy_words.iterator, dtype=Uint8), cute.make_layout((OUT_G,))
+        # the staged code stores: NC chunks per row, RPR rows per round through the warp's smem rows (CODE_STAGE_BYTES), the
+        # read-back by NC consecutive lanes per row, RPI rows per store instruction
+        NC = OUT_G // VEC_BYTES
+        RPR = CODE_STAGE_BYTES // OUT_G
+        RPI = 32 // NC
+        assert (
+            32 % NC == 0 and 32 % RPR == 0 and RPR % RPI == 0 and NC & (NC - 1) == 0
+        ), (NC, RPR, RPI)
+    atom_w4 = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), Uint32, num_bits_per_copy=8 * VEC_BYTES
+    )  # a 16-byte chunk as four words
+    mOut32 = None
+    if cutlass.const_expr(quant):
+        ldw = cute.assume(mOut.layout.stride[0], divby=16) // Int32(4)
+        mOut32 = cute.make_tensor(
+            cute.recast_ptr(mOut.iterator, dtype=Uint32),
+            cute.make_layout((Tk, N_out // Int32(4)), stride=(ldw, 1)),
         )
-    atom16 = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), Uint8, num_bits_per_copy=8 * VEC_BYTES
-    )
     parity = Int32(0)
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
@@ -924,28 +999,39 @@ def grouped_blockscale_epilogue_loop(
                 acc_state.advance()
         # ===== the chain and the store of this group's half of the tile's fold =====
         if cutlass.const_expr(quant):
-            # the fused requantization: the bf16-rounded chain values of the group's outputs in column order, then the block amax
+            # the fused requantization: the chain's values rounded to bf16 in packed pairs as they form (half the registers of the
+            # widened values: the promotion's budget holds them), the block amax folded over the pairs, the half-block amax
+            # exchanged with the warp holding the same rows in the other warpgroup
             amax = Float32(0.0)
             if warp_active:
+                run = None
+                pend = None
                 for k in cutlass.range_constexpr(per_group):
                     for v in cutlass.range_constexpr(V):
                         if cutlass.const_expr(is_out[v]):
                             if cutlass.const_expr(pair):
-                                yb = _chain_elem_bs(
+                                y = _chain_pre_bs(
                                     twin,
                                     tTR_rSum[k * V + v],
                                     tTR_rSum[k * V + partner[v]],
                                 )
                             else:
-                                yb = _chain_elem_bs(twin, tTR_rSum[k * V + v], None)
-                            ys_r[k * V_out + out_col[v]] = yb.to(Float32)
-                amax = block_amax_tree(CuteF32, [ys_r[j] for j in range(OUT_G)])
+                                y = _chain_pre_bs(twin, tTR_rSum[k * V + v], None)
+                            j = k * V_out + out_col[v]
+                            if cutlass.const_expr(j % 2 == 0):
+                                pend = y
+                            else:
+                                w = pack_bf16x2(pend, y)
+                                yw[j // 2] = w
+                                lo, hi = unpack_bf16x2(w)
+                                run = block_amax_fold(CuteF32, run, lo, hi)
+                amax = run
                 if cutlass.const_expr(SB == 2):
                     sX[(parity, gsel, tidx_g)] = amax
             if cutlass.const_expr(SB == 2):
                 cute.arch.barrier(
-                    barrier_id=Int32(BAR_XCH), number_of_threads=128 * NUM_PROMO_GROUPS
-                )  # both halves' amaxes are in
+                    barrier_id=Int32(BAR_XCH) + warp_q, number_of_threads=64
+                )  # both halves' amaxes of this warp's rows are in
                 if warp_active:
                     other = sX[(parity, Int32(1) - gsel, tidx_g)]
                     lo = amax  # the block's tree: combine(first half, second half)
@@ -957,9 +1043,11 @@ def grouped_blockscale_epilogue_loop(
                 parity = Int32(1) - parity
             if warp_active:
                 s_blk, inv = block_chain(CuteF32, amax)
-                yq = [quant_pre(CuteF32, ys_r[j], inv) for j in range(OUT_G)]
-                for w, word in enumerate(pack_block_codes(CuteF32, yq, "e4m3")):
-                    fy_words[w] = word
+                for q in cutlass.range_constexpr(OUT_G // 4):
+                    l0, h0 = unpack_bf16x2(yw[2 * q])
+                    l1, h1 = unpack_bf16x2(yw[2 * q + 1])
+                    yq = [quant_pre(CuteF32, y, inv) for y in (l0, h0, l1, h1)]
+                    fy_words[q] = pack_block_codes(CuteF32, yq, "e4m3")[0]
                 blk = n_tile * Int32(blocks_per_tile) + (
                     gsel if cutlass.const_expr(SB == 1) else Int32(0)
                 )
@@ -968,24 +1056,51 @@ def grouped_blockscale_epilogue_loop(
                 # tiles beyond the last one: their B boxes were zero-filled) are never stored
                 stored = (row_rel < rows_left) & (blk * Int32(QBLOCK) < N_out)
                 row_g = row0 + row_rel
-                if stored:
-                    dst = mOut[(row_g, None)]
-                    for h in cutlass.range_constexpr(OUT_G // VEC_BYTES):
-                        cute.copy(
-                            atom16,
-                            cute.local_tile(fy, (VEC_BYTES,), (h,)),
-                            cute.local_tile(
-                                dst,
-                                (VEC_BYTES,),
-                                (
-                                    blk * Int32(QBLOCK // VEC_BYTES)
-                                    + half * Int32(OUT_G // VEC_BYTES)
-                                    + h,
-                                ),
-                            ),
-                        )
                 if stored & (half == Int32(0)):
                     mSfo[(blk, row_g)] = s_blk
+                # the code stores, a round of rows at a time through the warp's smem rows: a lane stages its row's chunks, then
+                # NC consecutive lanes read and store one row's chunks (whole 16-byte chunks of a line per store instruction);
+                # the chunk slot is swizzled by the row so both the staging and the read-back are bank-conflict-free
+                lane = tidx_g % Int32(32)
+                col0 = blk * Int32(QBLOCK // VEC_BYTES) + half * Int32(NC)
+                blk_ok = blk * Int32(QBLOCK) < N_out
+                sQw32 = cute.make_tensor(
+                    cute.recast_ptr(sQ[(warp_idx, None)].iterator, dtype=Uint32),
+                    cute.make_layout((CODE_STAGE_BYTES // 4,)),
+                )
+                for t in cutlass.range_constexpr(32 // RPR):
+                    cute.arch.sync_warp()  # the previous round's chunks are read
+                    rr = irow - warp_row0 - Int32(t * RPR)
+                    if (rr >= Int32(0)) & (rr < Int32(RPR)):
+                        swz = ((rr * Int32(NC)) >> 3) & Int32(NC - 1)
+                        for c in cutlass.range_constexpr(NC):
+                            cute.copy(
+                                atom_w4,
+                                cute.local_tile(fy_words, (4,), (c,)),
+                                cute.local_tile(
+                                    sQw32, (4,), (rr * Int32(NC) + (Int32(c) ^ swz),)
+                                ),
+                            )
+                    cute.arch.sync_warp()
+                    for i in cutlass.range_constexpr(RPR // RPI):
+                        rr = Int32(i * RPI) + lane // Int32(NC)
+                        c = lane % Int32(NC)
+                        swz = ((rr * Int32(NC)) >> 3) & Int32(NC - 1)
+                        row_w = (
+                            warp_row0 + Int32(t * RPR) + rr
+                        )  # the row inside the CTA tile
+                        if (cta_row_rel + row_w < rows_left) & blk_ok:
+                            cute.copy(
+                                atom_w4,
+                                cute.local_tile(
+                                    sQw32, (4,), (rr * Int32(NC) + (c ^ swz),)
+                                ),
+                                cute.local_tile(
+                                    mOut32[(row0 + cta_row_rel + row_w, None)],
+                                    (4,),
+                                    (col0 + c,),
+                                ),
+                            )
         else:
             for k in cutlass.range_constexpr(per_group):
                 s = gsel * per_group + k  # the group's subtile index within the tile

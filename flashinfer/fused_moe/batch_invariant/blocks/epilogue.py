@@ -254,6 +254,10 @@ class GroupedEpilogueBlock:
         words; None for a chain without one."""
         return None
 
+    def stage_layout(self):
+        """The chain's own staging rows for its stores in the grouped body, as a layout of bytes; None for a chain without."""
+        return None
+
     def grouped_loop(self):
         """The chain's own grouped epilogue loop (a requantising chain), or None for :func:`grouped_epilogue_loop`."""
         return None
