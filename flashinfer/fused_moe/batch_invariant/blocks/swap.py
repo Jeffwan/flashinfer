@@ -258,7 +258,11 @@ class SwappedGroupedGemm:
         # the chains with their own swapped epilogue (the promoted block-scale fp8 loop, the MX fused requantization) read the
         # token rows through the box form only: the gather form's per-token map is the generic epilogue's
         own_loop = self.operands.promoted or chain.swapped_loop() is not None
-        assert not gather or self.in_fmt == "bf16" or (self.operands.block_scaled and not own_loop), (
+        assert (
+            not gather
+            or self.in_fmt == "bf16"
+            or (self.operands.block_scaled and not own_loop)
+        ), (
             "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' generic-epilogue chains' "
             "(the record's flag)",
             knobs,
@@ -1311,7 +1315,9 @@ class SwappedGroupedGemm:
                     if cutlass.const_expr(self.epi_wgs > 1)
                     else epi_tile,
                     acc_pipeline,
-                    subtile=tidx // 128 if cutlass.const_expr(self.epi_wgs > 1) else None,
+                    subtile=tidx // 128
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else None,
                     mAlpha=mAlpha,
                     mSa=mSa,
                     mSi=mSi,
