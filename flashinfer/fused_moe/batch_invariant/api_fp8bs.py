@@ -88,23 +88,8 @@ def quant_warps_per_row(
     return w
 
 
-def fp8_block_quantize(
-    x: torch.Tensor,
-    scale_layout: str = "MN",
-    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    wpr: Optional[int] = None,
-    enable_pdl: bool = True,
-    trigger: str = "none",
-    block: int = QBLOCK,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16 / f16, 16-byte-aligned rows, ``K`` a whole number of
-    ``block``-element blocks; ``block`` 128, or 32 for the ``moe.e4m3bs32`` classes): per block ``s = fmaxc(div(amax |x|, 448),
-    1e-12)``, ``q = cvt.rn.satfinite.e4m3(mul(x, div(1, s)))``. ``s`` is ``[K / block, M]`` (``"MN"``, FlashInfer's DeepSeek
-    activation layout) or ``[M, K / block]`` (``"K"``). ``out = (q, s)`` writes into the caller's tensors (``s`` in the requested
-    layout, any strides). Bitwise identical for every ``wpr`` (:func:`quant_warps_per_row`), every batch composition and across
-    runs."""
-    from .blocks.fp8bs_small import get_compiled_fp8bs_quant
-
+def _check_quant_input(x: torch.Tensor, block: int) -> Tuple[int, int]:
+    """The quantizer's input rule: a 2-D bf16 / f16 tensor with 16-byte-aligned contiguous rows, ``K`` whole blocks."""
     if x.dim() != 2 or x.dtype not in _DTYPE_STR:
         raise unsupported(
             "fp8bs.quant",
@@ -126,6 +111,76 @@ def fp8_block_quantize(
             f"rows with strides {tuple(x.stride())}",
             "16-byte-aligned contiguous rows",
         )
+    return M, K
+
+
+def fp8_block_quantize_plan(
+    x: torch.Tensor,
+    experts: torch.Tensor,
+    E: int,
+    block: int = QBLOCK,
+    wpr: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(q, s, counts, dest, src)``: :func:`fp8_block_quantize` of ``x [T, K]`` (the ``"MN"`` scale layout) and the dense
+    :func:`~.api.permute_plan` of ``experts [T, k]`` in one launch (the plan's CTAs, then the quantizer's: a placement, the
+    same bits and integers as the two launches); above the plan's multi-CTA threshold the two launches run."""
+    from .api import PLAN_MULTI_MIN_N
+    from .blocks.fp8bs_small import get_compiled_plan_quant
+
+    M, K = _check_quant_input(x, block)
+    if experts.dim() != 2 or experts.shape[0] != M:
+        raise ValueError(
+            f"fp8_block_quantize_plan: experts {tuple(experts.shape)} must be [T, k] for x of {M} rows"
+        )
+    n = experts.numel()
+    if n == 0 or n >= PLAN_MULTI_MIN_N:
+        q, s = fp8_block_quantize(x, "MN", block=block, wpr=wpr)
+        return (q, s) + tuple(permute_plan(experts, E))
+    if not 1 <= E <= MAX_E:
+        raise ValueError(
+            f"fp8_block_quantize_plan: E {E} must lie in [1, {MAX_E}] (the plan kernel's expert tables)"
+        )
+    if not 1 <= experts.shape[1] <= S.MAX_TOP_K:
+        raise ValueError(
+            f"fp8_block_quantize_plan: {experts.shape[1]} slots per token; the kernels fold at most {S.MAX_TOP_K}"
+        )
+    flat = experts.reshape(-1)
+    if not flat.is_contiguous() or flat.dtype != torch.int32:
+        raise TypeError(
+            "fp8_block_quantize_plan: experts must be a contiguous int32 [T, k]"
+        )
+    dev = x.device
+    KB = K // block
+    q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=dev)
+    s = torch.empty(KB, M, dtype=torch.float32, device=dev)
+    dest = torch.empty(n, dtype=torch.int32, device=dev)
+    src = torch.empty(n, dtype=torch.int32, device=dev)
+    counts = torch.empty(E, dtype=torch.int32, device=dev)
+    w = wpr if wpr is not None else quant_warps_per_row(M, K, sm_count_of(dev), block)
+    get_compiled_plan_quant(_DTYPE_STR[x.dtype], w, block)(
+        flat, counts, dest, src, x, q.view(torch.uint8), s.t(), n, E, M, K
+    )
+    return q, s, counts, dest.view(experts.shape), src
+
+
+def fp8_block_quantize(
+    x: torch.Tensor,
+    scale_layout: str = "MN",
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    wpr: Optional[int] = None,
+    enable_pdl: bool = True,
+    trigger: str = "none",
+    block: int = QBLOCK,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(q [M, K] float8_e4m3fn, s fp32)`` of ``x [M, K]`` (bf16 / f16, 16-byte-aligned rows, ``K`` a whole number of
+    ``block``-element blocks; ``block`` 128, or 32 for the ``moe.e4m3bs32`` classes): per block ``s = fmaxc(div(amax |x|, 448),
+    1e-12)``, ``q = cvt.rn.satfinite.e4m3(mul(x, div(1, s)))``. ``s`` is ``[K / block, M]`` (``"MN"``, FlashInfer's DeepSeek
+    activation layout) or ``[M, K / block]`` (``"K"``). ``out = (q, s)`` writes into the caller's tensors (``s`` in the requested
+    layout, any strides). Bitwise identical for every ``wpr`` (:func:`quant_warps_per_row`), every batch composition and across
+    runs."""
+    from .blocks.fp8bs_small import get_compiled_fp8bs_quant
+
+    M, K = _check_quant_input(x, block)
     if scale_layout not in SCALE_LAYOUTS:
         raise unsupported(
             "fp8bs.quant", f"scale_layout {scale_layout!r}", '"MN" or "K"'
@@ -612,7 +667,9 @@ def fused_moe_fp8bs(
     w_round: bool = False,
 ):
     """The block-scale fp8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 with ``sx`` its block scales (``[H / 128, T]``, or
-    ``[T, H / 128]``), ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r``
+    ``[T, H / 128]``) -- or the bf16 / f16 activations themselves with ``sx = None``: the class quantizes them by its own chain,
+    in one launch with the permutation plan (:func:`fp8_block_quantize_plan`) --, ``token_selected_experts [T, k]`` int32,
+    ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r``
     with the class's chains and rounding (:mod:`.spec_fp8bs`), the ``k`` slots folded in slot order in fp32 and converted once.
     ``config1`` / ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by
     default); ``fuse_quant``: the intermediate's requantization in GEMM1's epilogue (True) or by the standalone pass (False):
@@ -627,6 +684,31 @@ def fused_moe_fp8bs(
     from .permute import warps_per_row
     from .schedule_fp8bs import default_configs_fp8bs, fused_quant_default
 
+    if xq.dtype in _DTYPE_STR:
+        # bf16 / f16 activations: the class quantizes them itself -- with the dense plan in one launch when the plan is this
+        # call's (the pre-routed form), by the standalone quantizer when the plan is given (the routed form's route + plan)
+        if sx is not None:
+            raise ValueError(
+                "fused_moe_fp8bs: bf16 / f16 activations take no hidden_states_scale (the class quantizes them)"
+            )
+        _check_fused_inputs(
+            "fused_moe_fp8bs",
+            xq,
+            token_selected_experts,
+            token_final_scales,
+            out,
+            w.hidden_size,
+            xq.dtype,
+            8,
+            _DTYPE_STR[xq.dtype],
+        )
+        if plan is None:
+            xq, sx, counts_q, dest_q, src_q = fp8_block_quantize_plan(
+                xq, token_selected_experts.contiguous(), w.num_experts, block=w.block
+            )
+            plan = (counts_q, dest_q, src_q)
+        else:
+            xq, sx = fp8_block_quantize(xq, "MN", block=w.block)
     # the shared fused-entry rules (the rows' alignment, the ids and weights, the output)
     T, H, k, experts, scales, out = _check_fused_inputs(
         "fused_moe_fp8bs",
@@ -788,6 +870,7 @@ __all__ = [
     "MoEWeightsE4M3BS",
     "check_shape_fp8bs",
     "fp8_block_quantize",
+    "fp8_block_quantize_plan",
     "fused_moe_fp8bs",
     "grouped_gemm_fp8bs",
     "quant_warps_per_row",

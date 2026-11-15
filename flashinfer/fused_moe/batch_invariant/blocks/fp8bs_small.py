@@ -124,16 +124,31 @@ class BSQuantKernel:
         K: Int32,
         enable_pdl: cutlass.Constexpr[bool],
     ):
-        fp = CuteF32
-        wpr = self.wpr
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        lane = cute.arch.lane_idx()
         if cutlass.const_expr(enable_pdl):
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(self.trigger == "early"):
                 cute.arch.griddepcontrol_launch_dependents()
-        g = bidx * WARPS + tidx // LANES
+        self.rows(mX, mY, mS, M, K, bidx * WARPS + tidx // LANES)
+        if cutlass.const_expr(enable_pdl and self.trigger == "late"):
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def rows(
+        self,
+        mX: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        M: Int32,
+        K: Int32,
+        g: Int32,
+    ):
+        """The quantizer's warp ``g`` (row ``g // wpr``, part ``g % wpr``): the body of :meth:`kernel`, also run by the plan +
+        quantizer launch (:class:`PlanQuantKernel`) in the CTAs after the plan's."""
+        fp = CuteF32
+        wpr = self.wpr
+        lane = cute.arch.lane_idx()
         row_raw = g // Int32(wpr)
         part = g % Int32(wpr)
         valid = row_raw < M
@@ -179,8 +194,69 @@ class BSQuantKernel:
                 cute.copy(atom_y, fy, cute.local_tile(row_y, (V,), (chunk,)))
             if live & (sub == Int32(0)):
                 mS[(row, blk_c)] = s
-        if cutlass.const_expr(enable_pdl and self.trigger == "late"):
-            cute.arch.griddepcontrol_launch_dependents()
+
+
+class PlanQuantKernel:
+    """The pre-routed permutation plan and the activation quantizer in one launch: CTAs ``[0, E)`` run the plan's CTA
+    (:meth:`..permute.PlanKernel.cta` at this kernel's thread count), the CTAs after them the quantizer's warps
+    (:meth:`BSQuantKernel.rows`). The two read disjoint inputs (the expert ids; the bf16 rows) and write disjoint outputs, so
+    the launch is a placement of the two kernels: the same integers, the same bits. Every CTA waits for the predecessor
+    grid before its reads (the plan's rule) and none triggers."""
+
+    THREADS = WARPS * LANES
+
+    def __init__(self, dtype: cutlass.Numeric, wpr: int, block: int = BLOCK):
+        from ..permute import PlanKernel
+
+        self.quant = BSQuantKernel(dtype, wpr, "none", block)
+        self.plan = PlanKernel(threads=self.THREADS)
+
+    @cute.jit
+    def __call__(
+        self,
+        mExp: cute.Tensor,
+        mCounts: cute.Tensor,
+        mDest: cute.Tensor,
+        mSrc: cute.Tensor,
+        mX: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        n: Int32,
+        E: Int32,
+        M: Int32,
+        K: Int32,
+        stream,
+    ):
+        n_quant = cute.ceil_div(M * Int32(self.quant.wpr), WARPS)
+        self.kernel(mExp, mCounts, mDest, mSrc, mX, mY, mS, n, E, M, K).launch(
+            grid=[E + n_quant, 1, 1],
+            block=[self.THREADS, 1, 1],
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mExp: cute.Tensor,
+        mCounts: cute.Tensor,
+        mDest: cute.Tensor,
+        mSrc: cute.Tensor,
+        mX: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        n: Int32,
+        E: Int32,
+        M: Int32,
+        K: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        cute.arch.griddepcontrol_wait()
+        if bidx < E:
+            self.plan.cta(mExp, mCounts, mDest, mSrc, mDest, mDest, n, E, bidx, tidx)
+        else:
+            self.quant.rows(mX, mY, mS, M, K, (bidx - E) * WARPS + tidx // LANES)
 
 
 class GatherScalesKernel:
@@ -415,6 +491,69 @@ def get_compiled_fp8bs_quant(
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)
+
+
+def plan_quant_kernel_name(dtype_str: str, wpr: int, block: int = BLOCK) -> str:
+    """The plan + quantizer launch's name: the quantizer's input dtype, warps per row and block (the dense plan)."""
+    return jit.sanitize_symbol_name(
+        f"fp8bs_plan_quant_{dtype_str}_w{wpr}"
+        + (f"_b{block}" if check_block(block) != BLOCK else "")
+    )
+
+
+@functools.cache
+def get_compiled_plan_quant(dtype_str: str, wpr: int, block: int = BLOCK):
+    """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k] i32, src [T k] i32, x [M, K] 16-bit, codes [M, K] u8,
+    s (M, KB) f32 with free strides, n, E, M, K)``: the dense permutation plan and the quantizer in one launch."""
+    dtype = get_cutlass_dtype(dtype_str)
+
+    def compile_fn():
+        sym_n, sym_e = cute.sym_int(32), cute.sym_int(32)
+        sym_m, sym_k, sym_kb = (
+            cute.sym_int(32),
+            cute.sym_int(32, divisibility=block),
+            cute.sym_int(32),
+        )
+        e_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        s_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
+        x = cute.runtime.make_fake_tensor(
+            dtype, (sym_m, sym_k), (cute.sym_int64(divisibility=8), 1), assumed_align=16
+        )
+        y = cute.runtime.make_fake_tensor(
+            Uint8,
+            (sym_m, sym_k),
+            (cute.sym_int64(divisibility=16), 1),
+            assumed_align=16,
+        )
+        sc = cute.runtime.make_fake_tensor(
+            Float32,
+            (sym_m, sym_kb),
+            (cute.sym_int64(), cute.sym_int64()),
+            assumed_align=4,
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return cute.compile(
+            PlanQuantKernel(dtype, wpr, block),
+            e_fake,
+            c_fake,
+            d_fake,
+            s_fake,
+            x,
+            y,
+            sc,
+            Int32(1),
+            Int32(1),
+            Int32(1),
+            Int32(block),
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return jit.build_and_load(
+        MODULE, plan_quant_kernel_name(dtype_str, wpr, block), compile_fn
+    )
 
 
 @functools.cache

@@ -1077,6 +1077,68 @@ def test_layer_matches_the_class_composition(act):
 
 
 @needs_device
+def test_bf16_activations_quantize_in_the_plan_launch():
+    """bf16 activations handed to the op or the layer are quantized by the class's own chain in one launch with the dense
+    permutation plan: the launch's codes, scales and plan equal the two launches' bit for bit (and above the plan's multi-CTA
+    threshold the two launches run); the op from bf16 rows equals the op from the class's pair; the layer takes the raw-bf16
+    pack and gives the pair's bits; bf16 rows with a scale are refused; the routed form keeps its route + plan launch."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        PLAN_MULTI_MIN_N,
+        permute_plan,
+        route,
+    )
+    from flashinfer.fused_moe.batch_invariant.api_fp8bs import (
+        MoEWeightsE4M3BS,
+        fp8_block_quantize,
+        fp8_block_quantize_plan,
+        fused_moe_fp8bs,
+    )
+
+    for T, k, H, I, E, seed in ((7, 4, 512, 256, 32, 41), (40, 8, 1024, 512, 64, 43)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed, adversarial=True)
+        ids, wts = route(logits, k)
+        q0, s0 = fp8_block_quantize(x, "MN")
+        c0, d0, r0 = permute_plan(ids, E)
+        q1, s1, c1, d1, r1 = fp8_block_quantize_plan(x, ids, E)
+        assert torch.equal(q0.view(torch.uint8), q1.view(torch.uint8)) and torch.equal(
+            bits(s0), bits(s1)
+        )
+        assert torch.equal(c0, c1) and torch.equal(d0, d1) and torch.equal(r0, r1)
+        view = BatchInvariantFp8BlockConfig.prepare_weights(
+            w1, w2, quant=QUANT, activation=SwiGLU()
+        )
+        W = MoEWeightsE4M3BS.from_view(view)
+        ref = fused_moe_fp8bs(q0, s0, ids, wts, W)
+        assert torch.equal(bits(fused_moe_fp8bs(x, None, ids, wts, W)), bits(ref))
+        # a given plan (the routed form's): the standalone quantizer, the same bits
+        assert torch.equal(
+            bits(fused_moe_fp8bs(x, None, ids, wts, W, plan=(c0, d0, r0))), bits(ref)
+        )
+        with pytest.raises(ValueError):
+            fused_moe_fp8bs(x, s0, ids, wts, W)
+        # the layer: the raw-bf16 pack against the class's pair
+        Wp = _weights(w1, w2)
+        layer = _layer(k, E, I)
+        out_pair = layer(_routed_pack(q0, s0, ids, wts, packed=True), Wp)
+        out_bf16 = layer(_routed_pack(x, None, ids, wts, packed=True), Wp)
+        assert torch.equal(bits(out_pair), bits(out_bf16))
+        with pytest.raises((bi.BatchInvariantUnsupportedError, NotImplementedError)):
+            # the runner refuses the pair's scale beside bf16 rows (the layer refuses the pack's shape first)
+            layer(_routed_pack(x, s0, ids, wts, packed=True), Wp)
+    # above the plan's multi-CTA threshold: the two launches, the same outputs
+    T, k, H, I, E = PLAN_MULTI_MIN_N // 8 + 8, 8, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=47)
+    ids, _ = route(logits, k)
+    q0, s0 = fp8_block_quantize(x, "MN")
+    c0, d0, r0 = permute_plan(ids, E)
+    q1, s1, c1, d1, r1 = fp8_block_quantize_plan(x, ids, E)
+    assert torch.equal(q0.view(torch.uint8), q1.view(torch.uint8)) and torch.equal(
+        bits(s0), bits(s1)
+    )
+    assert torch.equal(c0, c1) and torch.equal(d0, d1) and torch.equal(r0, r1)
+
+
+@needs_device
 def test_input_quantization_is_the_class_on_the_device():
     """``prepare_activations`` runs the ``fp8bs.quant`` kernel: codes and block scales == the class's reference bit for bit on
     adversarial rows, in both scale layouts and every warps-per-row placement; R1 / R2 at op level; the layer takes the pair in
@@ -1606,7 +1668,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call (top_k /
     num_experts outside the bounds, fused shared experts, an expert-parallel shard, expert groups with a method other than
-    DeepSeekV3 from logits, a group shape outside the rule, no finalize, an intermediate size that is not a multiple of 128, a hidden size that is not, bf16 activations handed to the fp8 layer, no
+    DeepSeekV3 from logits, a group shape outside the rule, no finalize, an intermediate size that is not a multiple of 128, a hidden size that is not, bf16 activations with a scale tensor or f32 activations handed to the fp8 layer, no
     activation scale tensor, a scale tensor of the wrong shape, weights prepared for another activation, an unimplemented routing
     method from logits); a zero-token call returns an empty output."""
     k, H, I, E = 6, 512, 256, 64
@@ -1723,8 +1785,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     W = _weights(w1, w2)
     with pytest.raises(errors):
         layer(
-            _logits_pack(x, None, logits), W
-        )  # bf16 activations: no runner accepts the pack
+            _logits_pack(x, sx, logits), W
+        )  # bf16 activations with a scale tensor: the raw-bf16 pack carries no scale (the class quantizes the rows itself)
+    with pytest.raises(errors):
+        layer(
+            _logits_pack(x.float(), None, logits), W
+        )  # f32 activations: neither the pair nor the raw-bf16 pack
     with pytest.raises(errors):
         layer(_logits_pack(xq, None, logits), W)  # no block scales
     with pytest.raises(bi.BatchInvariantUnsupportedError):

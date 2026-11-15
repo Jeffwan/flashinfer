@@ -85,9 +85,11 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         x = act.hidden_states_q
         return (
             x.ndim == 2
-            and x.dtype == torch.float8_e4m3fn
             and x.shape[1] % QBLOCK == 0
-            and act.hidden_states_scale is not None
+            and (
+                (x.dtype == torch.float8_e4m3fn and act.hidden_states_scale is not None)
+                or (x.dtype == torch.bfloat16 and act.hidden_states_scale is None)
+            )
         )
 
     def pack_inputs(
@@ -101,14 +103,38 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
 
     def _act_tensors(self, act: MoEActivationPack) -> List[torch.Tensor]:
         """The pair's activation pack: the e4m3 rows and their fp32 block scales in the kernel's ``[H / block, T]`` layout
-        (the ``[T, H / block]`` layout taken too), and the class's shape rule on the configuration at this hidden size."""
+        (the ``[T, H / block]`` layout taken too), and the class's shape rule on the configuration at this hidden size; or
+        the raw bf16 rows with no scale (the class quantizes them in one launch with its permutation plan: the pack
+        contract's raw-bf16 encoding of a DeepSeek fp8 backend that quantizes internally), packed with an empty scale."""
         from .api_fp8bs import check_shape_fp8bs, scale_mn_view
 
         x = act.hidden_states_q
-        if x.dtype != self.X_DTYPE or x.ndim != 2:
+        if x.ndim != 2 or x.dtype not in (self.X_DTYPE, torch.bfloat16):
             raise unsupported(
-                self.CLASS, f"hidden_states_q {x.dtype} of rank {x.ndim}", self.X_RULE
+                self.CLASS,
+                f"hidden_states_q {x.dtype} of rank {x.ndim}",
+                self.X_RULE + ", or the bf16 rows with no scale",
             )
+        if x.dtype == torch.bfloat16:
+            if act.hidden_states_scale is not None:
+                raise unsupported(
+                    self.CLASS,
+                    "bf16 hidden_states_q with a hidden_states_scale",
+                    "bf16 rows with no scale (the class quantizes them), or the e4m3 pair",
+                )
+            x = x.contiguous()
+            T, H = x.shape
+            if H % QBLOCK:
+                raise unsupported(self.CLASS, f"hidden size {H}", self.ROW_RULE)
+            cfg = self.config
+            check_shape_fp8bs(
+                H,
+                cfg.experts.intermediate_size,
+                cfg.routing.num_experts,
+                cfg.routing.top_k,
+                self._block,
+            )
+            return [x, x.new_empty(0, dtype=torch.float32)]
         if act.hidden_states_scale is None:
             raise unsupported(self.CLASS, "no hidden_states_scale", self.SCALE_RULE)
         x = x.contiguous()
@@ -254,6 +280,8 @@ class BatchInvariantDeepSeekFp8Runner(BatchInvariantFp8BlockRunner):
         from .api_fp8bs import fused_moe_fp8bs
 
         xq, sx = x
+        if xq.dtype == torch.bfloat16:
+            sx = None  # the bf16 rows: quantized by the op (with the plan in one launch when the plan is the op's)
         fused_moe_fp8bs(
             xq,
             sx,
