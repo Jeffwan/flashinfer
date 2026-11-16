@@ -270,17 +270,16 @@ class SwappedGroupedGemm:
             self.in_fmt,
         )
         gather = gather or knobs.gather_a
-        # the MX fused requantization reads the token rows through the box form only (the gather form's per-token map is the
-        # generic epilogue's); the promoted block-scale fp8 loop has its own gather producer (the API's choice, as the bf16 form)
-        own_loop = self.operands.promoted or chain.swapped_loop() is not None
+        # the promoted block-scale fp8 loop has its own gather producer (the API's choice, as the bf16 form); the block-scaled
+        # chains' gather form is the record's flag (the MX fused requantization's gather and decode forms included)
         assert (
             not gather
             or self.in_fmt == "bf16"
             or self.operands.promoted
-            or (self.operands.block_scaled and not own_loop)
+            or self.operands.block_scaled
         ), (
             "the gather form is the bf16 and the block-scale fp8 classes' (the API's choice) and the block-scaled classes' "
-            "generic-epilogue chains' (the record's flag)",
+            "(the record's flag)",
             knobs,
             self.in_fmt,
         )
